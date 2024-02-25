@@ -50,6 +50,7 @@ import hubSpotIcon from "../../../public/HubSpot.png";
 import document360Icon from "../../../public/Document360.png";
 import googleSitesIcon from "../../../public/GoogleSites.png";
 import zendeskIcon from "../../../public/Zendesk.svg";
+import sharepointIcon from "../../../public/Sharepoint.png";
 import { FaRobot } from "react-icons/fa";
 
 interface IconProps {
@@ -302,6 +303,20 @@ export const ConnectorIcon = ({
 //  COMPANY LOGOS
 //
 
+export const LoopioIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return (
+    <div
+      style={{ width: `${size}px`, height: `${size}px` }}
+      className={`w-[${size}px] h-[${size}px] dark:invert ` + className}
+    >
+      <Image src="/Loopio.png" alt="Logo" width="96" height="96" />
+    </div>
+  );
+};
+
 export const SlackIcon = ({
   size = 16,
   className = defaultTailwindCSS,
@@ -315,7 +330,19 @@ export const SlackIcon = ({
     </div>
   );
 };
-
+export const GitlabIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return (
+    <div
+      style={{ width: `${size}px`, height: `${size}px` }}
+      className={`w-[${size}px] h-[${size}px] ` + className}
+    >
+      <Image src="/Gitlab.png" alt="Logo" width="96" height="96" />
+    </div>
+  );
+};
 export const GithubIcon = ({
   size = 16,
   className = defaultTailwindCSS,
@@ -326,6 +353,20 @@ export const GithubIcon = ({
       className={`w-[${size}px] h-[${size}px] ` + className}
     >
       <Image src="/Github.png" alt="Logo" width="96" height="96" />
+    </div>
+  );
+};
+
+export const GmailIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return (
+    <div
+      style={{ width: `${size}px`, height: `${size}px` }}
+      className={`w-[${size}px] h-[${size}px] ` + className}
+    >
+      <Image src="/Gmail.png" alt="Logo" width="96" height="96" />
     </div>
   );
 };
@@ -470,6 +511,18 @@ export const RequestTrackerIcon = ({
     className={`w-[${size}px] h-[${size}px] ` + className}
   >
     <Image src={requestTrackerIcon} alt="Logo" width="96" height="96" />
+  </div>
+);
+
+export const SharepointIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => (
+  <div
+    style={{ width: `${size}px`, height: `${size}px` }}
+    className={`w-[${size}px] h-[${size}px] ` + className}
+  >
+    <Image src={sharepointIcon} alt="Logo" width="96" height="96" />
   </div>
 );
 

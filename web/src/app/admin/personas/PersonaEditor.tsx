@@ -86,12 +86,14 @@ export function PersonaEditor({
           description: existingPersona?.description ?? "",
           system_prompt: existingPrompt?.system_prompt ?? "",
           task_prompt: existingPrompt?.task_prompt ?? "",
-          disable_retrieval: (existingPersona?.num_chunks ?? 5) === 0,
+          disable_retrieval: (existingPersona?.num_chunks ?? 10) === 0,
           document_set_ids:
             existingPersona?.document_sets?.map(
               (documentSet) => documentSet.id
             ) ?? ([] as number[]),
           num_chunks: existingPersona?.num_chunks ?? null,
+          include_citations:
+            existingPersona?.prompts[0]?.include_citations ?? true,
           llm_relevance_filter: existingPersona?.llm_relevance_filter ?? false,
           llm_model_version_override:
             existingPersona?.llm_model_version_override ?? null,
@@ -107,6 +109,7 @@ export function PersonaEditor({
             disable_retrieval: Yup.boolean().required(),
             document_set_ids: Yup.array().of(Yup.number()),
             num_chunks: Yup.number().max(20).nullable(),
+            include_citations: Yup.boolean().required(),
             llm_relevance_filter: Yup.boolean().required(),
             llm_model_version_override: Yup.string().nullable(),
           })
@@ -145,7 +148,7 @@ export function PersonaEditor({
           // to tell the backend to not fetch any documents
           const numChunks = values.disable_retrieval
             ? 0
-            : values.num_chunks || 5;
+            : values.num_chunks || 10;
 
           let promptResponse;
           let personaResponse;
@@ -240,6 +243,18 @@ export function PersonaEditor({
                 error={finalPromptError}
               />
 
+              {!values.disable_retrieval && (
+                <BooleanFormField
+                  name="include_citations"
+                  label="Include Citations"
+                  subtext={`
+                    If set, the response will include bracket citations ([1], [2], etc.) 
+                    for each document used by the LLM to help inform the response. This is 
+                    the same technique used by the default Personas. In general, we recommend 
+                    to leave this enabled in order to increase trust in the LLM answer.`}
+                />
+              )}
+
               <BooleanFormField
                 name="disable_retrieval"
                 label="Disable Retrieval"
@@ -261,7 +276,7 @@ export function PersonaEditor({
 
               {finalPrompt ? (
                 <pre className="text-sm mt-2 whitespace-pre-wrap">
-                  {finalPrompt.replaceAll("\\n", "\n")}
+                  {finalPrompt}
                 </pre>
               ) : (
                 "-"
@@ -399,7 +414,7 @@ export function PersonaEditor({
                         input length limit.
                         <br />
                         <br />
-                        If unspecified, will use 5 chunks.
+                        If unspecified, will use 10 chunks.
                       </div>
                     }
                     onChange={(e) => {

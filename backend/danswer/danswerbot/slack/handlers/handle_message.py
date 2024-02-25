@@ -1,21 +1,28 @@
+import functools
 import logging
+from collections.abc import Callable
+from typing import Any
 from typing import cast
+from typing import Optional
+from typing import TypeVar
 
 from retry import retry
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from sqlalchemy.orm import Session
 
+from danswer.chat.chat_utils import compute_max_document_tokens
 from danswer.configs.danswerbot_configs import DANSWER_BOT_ANSWER_GENERATION_TIMEOUT
 from danswer.configs.danswerbot_configs import DANSWER_BOT_DISABLE_COT
 from danswer.configs.danswerbot_configs import DANSWER_BOT_DISABLE_DOCS_ONLY_ANSWER
 from danswer.configs.danswerbot_configs import DANSWER_BOT_DISPLAY_ERROR_MSGS
 from danswer.configs.danswerbot_configs import DANSWER_BOT_NUM_RETRIES
+from danswer.configs.danswerbot_configs import DANSWER_BOT_TARGET_CHUNK_PERCENTAGE
 from danswer.configs.danswerbot_configs import DANSWER_REACT_EMOJI
 from danswer.configs.danswerbot_configs import DISABLE_DANSWER_BOT_FILTER_DETECT
 from danswer.configs.danswerbot_configs import ENABLE_DANSWERBOT_REFLEXION
-from danswer.connectors.slack.utils import make_slack_api_rate_limited
 from danswer.danswerbot.slack.blocks import build_documents_blocks
+from danswer.danswerbot.slack.blocks import build_follow_up_block
 from danswer.danswerbot.slack.blocks import build_qa_response_blocks
 from danswer.danswerbot.slack.blocks import get_restate_blocks
 from danswer.danswerbot.slack.constants import SLACK_CHANNEL_ID
@@ -23,8 +30,14 @@ from danswer.danswerbot.slack.models import SlackMessageInfo
 from danswer.danswerbot.slack.utils import ChannelIdAdapter
 from danswer.danswerbot.slack.utils import fetch_userids_from_emails
 from danswer.danswerbot.slack.utils import respond_in_thread
+from danswer.danswerbot.slack.utils import slack_usage_report
+from danswer.danswerbot.slack.utils import SlackRateLimiter
+from danswer.danswerbot.slack.utils import update_emote_react
 from danswer.db.engine import get_sqlalchemy_engine
 from danswer.db.models import SlackBotConfig
+from danswer.llm.utils import check_number_of_tokens
+from danswer.llm.utils import get_default_llm_version
+from danswer.llm.utils import get_max_input_tokens
 from danswer.one_shot_answer.answer_question import get_search_answer
 from danswer.one_shot_answer.models import DirectQARequest
 from danswer.one_shot_answer.models import OneShotQAResponse
@@ -32,10 +45,31 @@ from danswer.search.models import BaseFilters
 from danswer.search.models import OptionalSearchSetting
 from danswer.search.models import RetrievalDetails
 from danswer.utils.logger import setup_logger
-from danswer.utils.telemetry import optional_telemetry
-from danswer.utils.telemetry import RecordType
 
 logger_base = setup_logger()
+
+srl = SlackRateLimiter()
+
+RT = TypeVar("RT")  # return type
+
+
+def rate_limits(
+    client: WebClient, channel: str, thread_ts: Optional[str]
+) -> Callable[[Callable[..., RT]], Callable[..., RT]]:
+    def decorator(func: Callable[..., RT]) -> Callable[..., RT]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> RT:
+            if not srl.is_available():
+                func_randid, position = srl.init_waiter()
+                srl.notify(client, channel, position, thread_ts)
+                while not srl.is_available():
+                    srl.waiter(func_randid)
+            srl.acquire_slot()
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def send_msg_ack_to_user(details: SlackMessageInfo, client: WebClient) -> None:
@@ -49,23 +83,12 @@ def send_msg_ack_to_user(details: SlackMessageInfo, client: WebClient) -> None:
         )
         return
 
-    slack_call = make_slack_api_rate_limited(client.reactions_add)
-    slack_call(
-        name=DANSWER_REACT_EMOJI,
+    update_emote_react(
+        emoji=DANSWER_REACT_EMOJI,
         channel=details.channel_to_respond,
-        timestamp=details.msg_to_respond,
-    )
-
-
-def remove_react(details: SlackMessageInfo, client: WebClient) -> None:
-    if details.is_bot_msg:
-        return
-
-    slack_call = make_slack_api_rate_limited(client.reactions_remove)
-    slack_call(
-        name=DANSWER_REACT_EMOJI,
-        channel=details.channel_to_respond,
-        timestamp=details.msg_to_respond,
+        message_ts=details.msg_to_respond,
+        remove=False,
+        client=client,
     )
 
 
@@ -80,6 +103,7 @@ def handle_message(
     disable_auto_detect_filters: bool = DISABLE_DANSWER_BOT_FILTER_DETECT,
     reflexion: bool = ENABLE_DANSWERBOT_REFLEXION,
     disable_cot: bool = DANSWER_BOT_DISABLE_COT,
+    thread_context_percent: float = DANSWER_BOT_TARGET_CHUNK_PERCENTAGE,
 ) -> bool:
     """Potentially respond to the user message depending on filters and if an answer was generated
 
@@ -101,8 +125,6 @@ def handle_message(
     bypass_filters = message_info.bypass_filters
     is_bot_msg = message_info.is_bot_msg
     is_bot_dm = message_info.is_bot_dm
-
-    engine = get_sqlalchemy_engine()
 
     document_set_names: list[str] | None = None
     persona = channel_config.persona if channel_config else None
@@ -130,6 +152,7 @@ def handle_message(
         # with non-public document sets
         bypass_acl = True
 
+    channel_conf = None
     if channel_config and channel_config.channel_config:
         channel_conf = channel_config.channel_config
         if not bypass_filters and "answer_filters" in channel_conf:
@@ -161,7 +184,7 @@ def handle_message(
         return False
 
     if respond_team_member_list:
-        send_to = fetch_userids_from_emails(respond_team_member_list, client)
+        send_to, _ = fetch_userids_from_emails(respond_team_member_list, client)
 
     # If configured to respond to team members only, then cannot be used with a /DanswerBot command
     # which would just respond to the sender
@@ -186,6 +209,7 @@ def handle_message(
         backoff=2,
         logger=logger,
     )
+    @rate_limits(client=client, channel=channel, thread_ts=message_ts_to_respond_to)
     def _get_answer(new_message_request: DirectQARequest) -> OneShotQAResponse:
         action = "slack_message"
         if is_bot_msg:
@@ -194,16 +218,43 @@ def handle_message(
             action = "slack_tag_message"
         elif is_bot_dm:
             action = "slack_dm_message"
-        optional_telemetry(
-            record_type=RecordType.USAGE,
-            data={"action": action},
-        )
 
-        with Session(engine, expire_on_commit=False) as db_session:
+        slack_usage_report(action=action, sender_id=sender_id, client=client)
+
+        max_document_tokens: int | None = None
+        max_history_tokens: int | None = None
+        if len(new_message_request.messages) > 1:
+            llm_name = get_default_llm_version()[0]
+            if persona and persona.llm_model_version_override:
+                llm_name = persona.llm_model_version_override
+
+            # In cases of threads, split the available tokens between docs and thread context
+            input_tokens = get_max_input_tokens(model_name=llm_name)
+            max_history_tokens = int(input_tokens * thread_context_percent)
+
+            remaining_tokens = input_tokens - max_history_tokens
+
+            query_text = new_message_request.messages[0].message
+            if persona:
+                max_document_tokens = compute_max_document_tokens(
+                    persona=persona,
+                    actual_user_input=query_text,
+                    max_llm_token_override=remaining_tokens,
+                )
+            else:
+                max_document_tokens = (
+                    remaining_tokens
+                    - 512  # Needs to be more than any of the QA prompts
+                    - check_number_of_tokens(query_text)
+                )
+
+        with Session(get_sqlalchemy_engine()) as db_session:
             # This also handles creating the query event in postgres
             answer = get_search_answer(
                 query_req=new_message_request,
                 user=None,
+                max_document_tokens=max_document_tokens,
+                max_history_tokens=max_history_tokens,
                 db_session=db_session,
                 answer_generation_timeout=answer_generation_timeout,
                 enable_reflexion=reflexion,
@@ -223,8 +274,9 @@ def handle_message(
             time_cutoff=None,
         )
 
+        # Default True because no other ways to apply filters in Slack (no nice UI)
         auto_detect_filters = (
-            persona.llm_filter_extraction if persona is not None else False
+            persona.llm_filter_extraction if persona is not None else True
         )
         if disable_auto_detect_filters:
             auto_detect_filters = False
@@ -264,7 +316,13 @@ def handle_message(
 
         # In case of failures, don't keep the reaction there permanently
         try:
-            remove_react(message_info, client)
+            update_emote_react(
+                emoji=DANSWER_REACT_EMOJI,
+                channel=message_info.channel_to_respond,
+                message_ts=message_info.msg_to_respond,
+                remove=True,
+                client=client,
+            )
         except SlackApiError as e:
             logger.error(f"Failed to remove Reaction due to: {e}")
 
@@ -272,7 +330,13 @@ def handle_message(
 
     # Got an answer at this point, can remove reaction and give results
     try:
-        remove_react(message_info, client)
+        update_emote_react(
+            emoji=DANSWER_REACT_EMOJI,
+            channel=message_info.channel_to_respond,
+            message_ts=message_info.msg_to_respond,
+            remove=True,
+            client=client,
+        )
     except SlackApiError as e:
         logger.error(f"Failed to remove Reaction due to: {e}")
 
@@ -342,13 +406,18 @@ def handle_message(
         else []
     )
 
+    all_blocks = restate_question_block + answer_blocks + document_blocks
+
+    if channel_conf and channel_conf.get("follow_up_tags") is not None:
+        all_blocks.append(build_follow_up_block(message_id=answer.chat_message_id))
+
     try:
         respond_in_thread(
             client=client,
             channel=channel,
             receiver_ids=send_to,
             text="Hello! Danswer has some results for you!",
-            blocks=restate_question_block + answer_blocks + document_blocks,
+            blocks=all_blocks,
             thread_ts=message_ts_to_respond_to,
             # don't unfurl, since otherwise we will have 5+ previews which makes the message very long
             unfurl=False,

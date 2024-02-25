@@ -1,17 +1,21 @@
+import itertools
 from collections.abc import Callable
 from collections.abc import Iterator
 from typing import cast
 
 from sqlalchemy.orm import Session
 
+from danswer.chat.chat_utils import compute_max_document_tokens
 from danswer.chat.chat_utils import get_chunks_for_qa
 from danswer.chat.models import DanswerAnswerPiece
+from danswer.chat.models import DanswerContext
+from danswer.chat.models import DanswerContexts
 from danswer.chat.models import DanswerQuotes
 from danswer.chat.models import LLMMetricsContainer
 from danswer.chat.models import LLMRelevanceFilterResponse
 from danswer.chat.models import QADocsResponse
 from danswer.chat.models import StreamingError
-from danswer.configs.chat_configs import DEFAULT_NUM_CHUNKS_FED_TO_CHAT
+from danswer.configs.chat_configs import MAX_CHUNKS_FED_TO_CHAT
 from danswer.configs.chat_configs import QA_TIMEOUT
 from danswer.configs.constants import MessageType
 from danswer.configs.model_configs import CHUNK_SIZE
@@ -21,6 +25,7 @@ from danswer.db.chat import get_or_create_root_message
 from danswer.db.chat import get_persona_by_id
 from danswer.db.chat import get_prompt_by_id
 from danswer.db.chat import translate_db_message_to_chat_message_detail
+from danswer.db.embedding_model import get_current_db_embedding_model
 from danswer.db.models import User
 from danswer.document_index.factory import get_default_document_index
 from danswer.indexing.models import InferenceChunk
@@ -50,9 +55,14 @@ logger = setup_logger()
 def stream_answer_objects(
     query_req: DirectQARequest,
     user: User | None,
+    # These need to be passed in because in Web UI one shot flow,
+    # we can have much more document as there is no history.
+    # For Slack flow, we need to save more tokens for the thread context
+    max_document_tokens: int | None,
+    max_history_tokens: int | None,
     db_session: Session,
     # Needed to translate persona num_chunks to tokens to the LLM
-    default_num_chunks: float = DEFAULT_NUM_CHUNKS_FED_TO_CHAT,
+    default_num_chunks: float = MAX_CHUNKS_FED_TO_CHAT,
     default_chunk_size: int = CHUNK_SIZE,
     timeout: int = QA_TIMEOUT,
     bypass_acl: bool = False,
@@ -66,6 +76,7 @@ def stream_answer_objects(
     | LLMRelevanceFilterResponse
     | DanswerAnswerPiece
     | DanswerQuotes
+    | DanswerContexts
     | StreamingError
     | ChatMessageDetail
 ]:
@@ -89,19 +100,28 @@ def stream_answer_objects(
     )
 
     llm_tokenizer = get_default_llm_token_encode()
-    document_index = get_default_document_index()
+
+    embedding_model = get_current_db_embedding_model(db_session)
+
+    document_index = get_default_document_index(
+        primary_index_name=embedding_model.index_name, secondary_index_name=None
+    )
 
     # Create a chat session which will just store the root message, the query, and the AI response
     root_message = get_or_create_root_message(
         chat_session_id=chat_session.id, db_session=db_session
     )
 
-    history_str = combine_message_thread(history)
+    history_str = combine_message_thread(
+        messages=history, max_tokens=max_history_tokens
+    )
 
     rephrased_query = thread_based_query_rephrase(
         user_query=query_msg.message,
         history_str=history_str,
     )
+    # Given back ahead of the documents for latency reasons
+    # In chat flow it's given back along with the documents
     yield QueryRephrase(rephrased_query=rephrased_query)
 
     (
@@ -120,6 +140,7 @@ def stream_answer_objects(
     documents_generator = full_chunk_search_generator(
         search_query=retrieval_request,
         document_index=document_index,
+        db_session=db_session,
         retrieval_metrics_callback=retrieval_metrics_callback,
         rerank_metrics_callback=rerank_metrics_callback,
     )
@@ -135,6 +156,7 @@ def stream_answer_objects(
 
     # Since this is in the one shot answer flow, we don't need to actually save the docs to DB
     initial_response = QADocsResponse(
+        rephrased_query=rephrased_query,
         top_documents=fake_saved_docs,
         predicted_flow=predicted_flow,
         predicted_search=predicted_search_type,
@@ -163,10 +185,20 @@ def stream_answer_objects(
         if chat_session.persona.num_chunks is not None
         else default_num_chunks
     )
+
+    chunk_token_limit = int(num_llm_chunks * default_chunk_size)
+    if max_document_tokens:
+        chunk_token_limit = min(chunk_token_limit, max_document_tokens)
+    else:
+        max_document_tokens = compute_max_document_tokens(
+            persona=chat_session.persona, actual_user_input=query_msg.message
+        )
+        chunk_token_limit = min(chunk_token_limit, max_document_tokens)
+
     llm_chunks_indices = get_chunks_for_qa(
         chunks=top_chunks,
         llm_chunk_selection=llm_chunk_selection,
-        token_limit=num_llm_chunks * default_chunk_size,
+        token_limit=chunk_token_limit,
     )
     llm_chunks = [top_chunks[i] for i in llm_chunks_indices]
 
@@ -222,6 +254,21 @@ def stream_answer_objects(
         else no_gen_ai_response()
     )
 
+    if qa_model is not None and query_req.return_contexts:
+        contexts = DanswerContexts(
+            contexts=[
+                DanswerContext(
+                    content=context_doc.content,
+                    document_id=context_doc.document_id,
+                    semantic_identifier=context_doc.semantic_identifier,
+                    blurb=context_doc.semantic_identifier,
+                )
+                for context_doc in llm_chunks
+            ]
+        )
+
+        response_packets = itertools.chain(response_packets, [contexts])
+
     # Capture outputs and errors
     llm_output = ""
     error: str | None = None
@@ -262,10 +309,16 @@ def stream_answer_objects(
 def stream_search_answer(
     query_req: DirectQARequest,
     user: User | None,
+    max_document_tokens: int | None,
+    max_history_tokens: int | None,
     db_session: Session,
 ) -> Iterator[str]:
     objects = stream_answer_objects(
-        query_req=query_req, user=user, db_session=db_session
+        query_req=query_req,
+        user=user,
+        max_document_tokens=max_document_tokens,
+        max_history_tokens=max_history_tokens,
+        db_session=db_session,
     )
     for obj in objects:
         yield get_json_line(obj.dict())
@@ -274,6 +327,8 @@ def stream_search_answer(
 def get_search_answer(
     query_req: DirectQARequest,
     user: User | None,
+    max_document_tokens: int | None,
+    max_history_tokens: int | None,
     db_session: Session,
     answer_generation_timeout: int = QA_TIMEOUT,
     enable_reflexion: bool = False,
@@ -289,6 +344,8 @@ def get_search_answer(
     results = stream_answer_objects(
         query_req=query_req,
         user=user,
+        max_document_tokens=max_document_tokens,
+        max_history_tokens=max_history_tokens,
         db_session=db_session,
         bypass_acl=bypass_acl,
         timeout=answer_generation_timeout,
@@ -309,6 +366,8 @@ def get_search_answer(
             qa_response.llm_chunks_indices = packet.relevant_chunk_indices
         elif isinstance(packet, DanswerQuotes):
             qa_response.quotes = packet
+        elif isinstance(packet, DanswerContexts):
+            qa_response.contexts = packet
         elif isinstance(packet, StreamingError):
             qa_response.error_msg = packet.error
         elif isinstance(packet, ChatMessageDetail):

@@ -75,9 +75,12 @@ class SlackBotConfigCreationRequest(BaseModel):
     persona_id: int | None  # NOTE: only one of `document_sets` / `persona_id` should be set
     channel_names: list[str]
     respond_tag_only: bool = False
+    respond_to_bots: bool = False
     # If no team members, assume respond in the channel to everyone
     respond_team_member_list: list[str] = []
     answer_filters: list[AllowedAnswerFilters] = []
+    # list of user emails
+    follow_up_tags: list[str] | None = None
 
     @validator("answer_filters", pre=True)
     def validate_filters(cls, value: list[str]) -> list[str]:
@@ -101,3 +104,12 @@ class SlackBotConfig(BaseModel):
     id: int
     persona: PersonaSnapshot | None
     channel_config: ChannelConfig
+
+
+class ModelVersionResponse(BaseModel):
+    model_name: str | None  # None only applicable to secondary index
+
+
+class FullModelVersionResponse(BaseModel):
+    current_model_name: str
+    secondary_model_name: str | None
