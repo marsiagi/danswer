@@ -5,3 +5,6 @@
 .idea
 /deployment/data/nginx/app.conf
 .vscode/launch.json
+assistant_emails
+enron-emails
+emails.csv
