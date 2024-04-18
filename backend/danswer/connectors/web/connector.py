@@ -27,6 +27,7 @@ from danswer.connectors.models import Document
 from danswer.connectors.models import Section
 from danswer.utils.logger import setup_logger
 
+
 logger = setup_logger()
 
 
@@ -39,6 +40,27 @@ class WEB_CONNECTOR_VALID_SETTINGS(str, Enum):
     SITEMAP = "sitemap"
     # Given a file upload where every line is a URL, parse all the URLs provided
     UPLOAD = "upload"
+
+
+def protected_url_check(url: str) -> None:
+    parse = urlparse(url)
+    if parse.scheme == "file":
+        raise ValueError("Not permitted to read local files via Web Connector.")
+    if (
+        parse.scheme == "localhost"
+        or parse.scheme == "127.0.0.1"
+        or parse.hostname == "localhost"
+        or parse.hostname == "127.0.0.1"
+    ):
+        raise ValueError("Not permitted to read localhost urls.")
+
+
+def check_internet_connection(url: str) -> None:
+    try:
+        response = requests.get(url, timeout=3)
+        response.raise_for_status()
+    except (requests.RequestException, ValueError):
+        raise Exception(f"Unable to reach {url} - check your internet connection")
 
 
 def is_valid_url(url: str) -> bool:
@@ -100,9 +122,16 @@ def extract_urls_from_sitemap(sitemap_url: str) -> list[str]:
     response.raise_for_status()
 
     soup = BeautifulSoup(response.content, "html.parser")
-    urls = [loc_tag.text for loc_tag in soup.find_all("loc")]
+    return [
+        _ensure_absolute_url(sitemap_url, loc_tag.text)
+        for loc_tag in soup.find_all("loc")
+    ]
 
-    return urls
+
+def _ensure_absolute_url(source_url: str, maybe_relative_url: str) -> str:
+    if not urlparse(maybe_relative_url).netloc:
+        return urljoin(source_url, maybe_relative_url)
+    return maybe_relative_url
 
 
 def _ensure_valid_url(url: str) -> str:
@@ -141,6 +170,10 @@ class WebConnector(LoadConnector):
             self.to_visit_list = extract_urls_from_sitemap(_ensure_valid_url(base_url))
 
         elif web_connector_type == WEB_CONNECTOR_VALID_SETTINGS.UPLOAD:
+            logger.warning(
+                "This is not a UI supported Web Connector flow, "
+                "are you sure you want to do this?"
+            )
             self.to_visit_list = _read_urls_file(base_url)
 
         else:
@@ -169,9 +202,12 @@ class WebConnector(LoadConnector):
                 continue
             visited_links.add(current_url)
 
+            protected_url_check(current_url)
+
             logger.info(f"Visiting {current_url}")
 
             try:
+                check_internet_connection(current_url)
                 if restart_playwright:
                     playwright, context = start_playwright()
                     restart_playwright = False
@@ -195,7 +231,7 @@ class WebConnector(LoadConnector):
                     continue
 
                 page = context.new_page()
-                page.goto(current_url)
+                page_response = page.goto(current_url)
                 final_page = page.url
                 if final_page != current_url:
                     logger.info(f"Redirected to {final_page}")
@@ -213,6 +249,12 @@ class WebConnector(LoadConnector):
                     for link in internal_links:
                         if link not in visited_links:
                             to_visit.append(link)
+
+                if page_response and str(page_response.status)[0] in ("4", "5"):
+                    logger.info(
+                        f"Skipped indexing {current_url} due to HTTP {page_response.status} response"
+                    )
+                    continue
 
                 parsed_html = web_html_cleanup(soup, self.mintlify_cleanup)
 

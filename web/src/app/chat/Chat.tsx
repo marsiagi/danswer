@@ -1,20 +1,22 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { FiRefreshCcw, FiSend, FiStopCircle } from "react-icons/fi";
+import { FiSend, FiShare2, FiStopCircle } from "react-icons/fi";
 import { AIMessage, HumanMessage } from "./message/Messages";
 import { AnswerPiecePacket, DanswerDocument } from "@/lib/search/interfaces";
 import {
   BackendChatSession,
   BackendMessage,
+  ChatSessionSharedStatus,
   DocumentsResponse,
   Message,
   RetrievalType,
   StreamingError,
 } from "./interfaces";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { FeedbackType } from "./types";
 import {
+  buildChatUrl,
   createChatSession,
   getCitedDocumentsFromMessage,
   getHumanAndAIMessageFromMessageNumber,
@@ -43,6 +45,9 @@ import { ChatIntro } from "./ChatIntro";
 import { HEADER_PADDING } from "@/lib/constants";
 import { computeAvailableFilters } from "@/lib/filters";
 import { useDocumentSelection } from "./useDocumentSelection";
+import { StarterMessage } from "./StarterMessage";
+import { ShareChatSessionModal } from "./modal/ShareChatSessionModal";
+import { SEARCH_PARAM_NAMES, shouldSubmitOnLoad } from "./searchParams";
 
 const MAX_INPUT_HEIGHT = 200;
 
@@ -68,6 +73,13 @@ export const Chat = ({
   shouldhideBeforeScroll?: boolean;
 }) => {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  // used to track whether or not the initial "submit on load" has been performed
+  // this only applies if `?submit-on-load=true` or `?submit-on-load=1` is in the URL
+  // NOTE: this is required due to React strict mode, where all `useEffect` hooks
+  // are run twice on initial load during development
+  const submitOnLoadPerformed = useRef<boolean>(false);
+
   const { popup, setPopup } = usePopup();
 
   // fetch messages for the chat session
@@ -113,6 +125,17 @@ export const Chat = ({
           setSelectedPersona(undefined);
         }
         setMessageHistory([]);
+        setChatSessionSharedStatus(ChatSessionSharedStatus.Private);
+
+        // if we're supposed to submit on initial load, then do that here
+        if (
+          shouldSubmitOnLoad(searchParams) &&
+          !submitOnLoadPerformed.current
+        ) {
+          submitOnLoadPerformed.current = true;
+          await onSubmit();
+        }
+
         return;
       }
 
@@ -126,6 +149,7 @@ export const Chat = ({
           (persona) => persona.id === chatSession.persona_id
         )
       );
+
       const newMessageHistory = processRawChatHistory(chatSession.messages);
       setMessageHistory(newMessageHistory);
 
@@ -135,7 +159,24 @@ export const Chat = ({
         latestMessageId !== undefined ? latestMessageId : null
       );
 
+      setChatSessionSharedStatus(chatSession.shared_status);
+
       setIsFetchingChatMessages(false);
+
+      // if this is a seeded chat, then kick off the AI message generation
+      if (newMessageHistory.length === 1 && !submitOnLoadPerformed.current) {
+        submitOnLoadPerformed.current = true;
+        const seededMessage = newMessageHistory[0].message;
+        await onSubmit({
+          isSeededChat: true,
+          messageOverride: seededMessage,
+        });
+        // force re-name if the chat session doesn't have one
+        if (!chatSession.description) {
+          await nameChatSession(existingChatSessionId, seededMessage);
+          router.refresh(); // need to refresh to update name on sidebar
+        }
+      }
     }
 
     initialSessionFetch();
@@ -144,7 +185,9 @@ export const Chat = ({
   const [chatSessionId, setChatSessionId] = useState<number | null>(
     existingChatSessionId
   );
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState(
+    searchParams.get(SEARCH_PARAM_NAMES.USER_MESSAGE) || ""
+  );
   const [messageHistory, setMessageHistory] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
 
@@ -171,6 +214,9 @@ export const Chat = ({
         : undefined
   );
   const livePersona = selectedPersona || availablePersonas[0];
+
+  const [chatSessionSharedStatus, setChatSessionSharedStatus] =
+    useState<ChatSessionSharedStatus>(ChatSessionSharedStatus.Private);
 
   useEffect(() => {
     if (messageHistory.length === 0 && chatSessionId === null) {
@@ -224,6 +270,8 @@ export const Chat = ({
   const [currentFeedback, setCurrentFeedback] = useState<
     [FeedbackType, number] | null
   >(null);
+  const [sharingModalVisible, setSharingModalVisible] =
+    useState<boolean>(false);
 
   // auto scroll as message comes out
   const scrollableDivRef = useRef<HTMLDivElement>(null);
@@ -290,17 +338,27 @@ export const Chat = ({
 
   const onSubmit = async ({
     messageIdToResend,
+    messageOverride,
     queryOverride,
     forceSearch,
+    isSeededChat,
   }: {
     messageIdToResend?: number;
+    messageOverride?: string;
     queryOverride?: string;
     forceSearch?: boolean;
+    isSeededChat?: boolean;
   } = {}) => {
     let currChatSessionId: number;
     let isNewSession = chatSessionId === null;
+    const searchParamBasedChatSessionName =
+      searchParams.get(SEARCH_PARAM_NAMES.TITLE) || null;
+
     if (isNewSession) {
-      currChatSessionId = await createChatSession(livePersona?.id || 0);
+      currChatSessionId = await createChatSession(
+        livePersona?.id || 0,
+        searchParamBasedChatSessionName
+      );
     } else {
       currChatSessionId = chatSessionId as number;
     }
@@ -321,7 +379,10 @@ export const Chat = ({
       return;
     }
 
-    const currMessage = messageToResend ? messageToResend.message : message;
+    let currMessage = messageToResend ? messageToResend.message : message;
+    if (messageOverride) {
+      currMessage = messageOverride;
+    }
     const currMessageHistory =
       messageToResendIndex !== null
         ? messageHistory.slice(0, messageToResendIndex)
@@ -353,7 +414,7 @@ export const Chat = ({
         message: currMessage,
         parentMessageId: lastSuccessfulMessageId,
         chatSessionId: currChatSessionId,
-        promptId: selectedPersona?.prompts[0]?.id || 0,
+        promptId: livePersona?.prompts[0]?.id || 0,
         filters: buildFilters(
           filterManager.selectedSources,
           filterManager.selectedDocumentSets,
@@ -368,6 +429,14 @@ export const Chat = ({
           .map((document) => document.db_doc_id as number),
         queryOverride,
         forceSearch,
+        modelVersion:
+          searchParams.get(SEARCH_PARAM_NAMES.MODEL_VERSION) || undefined,
+        temperature:
+          parseFloat(searchParams.get(SEARCH_PARAM_NAMES.TEMPERATURE) || "") ||
+          undefined,
+        systemPromptOverride:
+          searchParams.get(SEARCH_PARAM_NAMES.SYSTEM_PROMPT) || undefined,
+        useExistingUserMessage: isSeededChat,
       })) {
         for (const packet of packetBunch) {
           if (Object.hasOwn(packet, "answer_piece")) {
@@ -430,14 +499,16 @@ export const Chat = ({
       if (finalMessage) {
         setSelectedMessageForDocDisplay(finalMessage.message_id);
       }
-      await nameChatSession(currChatSessionId, currMessage);
+      if (!searchParamBasedChatSessionName) {
+        await nameChatSession(currChatSessionId, currMessage);
+      }
 
       // NOTE: don't switch pages if the user has navigated away from the chat
       if (
         currChatSessionId === urlChatSessionId.current ||
         urlChatSessionId.current === null
       ) {
-        router.push(`/chat?chatId=${currChatSessionId}`, {
+        router.push(buildChatUrl(searchParams, currChatSessionId, null), {
           scroll: false,
         });
       }
@@ -497,15 +568,34 @@ export const Chat = ({
         />
       )}
 
+      {sharingModalVisible && chatSessionId !== null && (
+        <ShareChatSessionModal
+          chatSessionId={chatSessionId}
+          existingSharedStatus={chatSessionSharedStatus}
+          onClose={() => setSharingModalVisible(false)}
+          onShare={(shared) =>
+            setChatSessionSharedStatus(
+              shared
+                ? ChatSessionSharedStatus.Public
+                : ChatSessionSharedStatus.Private
+            )
+          }
+        />
+      )}
+
       {documentSidebarInitialWidth !== undefined ? (
         <>
-          <div className="w-full sm:relative h-screen pb-[140px]">
+          <div
+            className={`w-full sm:relative h-screen ${
+              retrievalDisabled ? "pb-[111px]" : "pb-[140px]"
+            }`}
+          >
             <div
               className={`w-full h-full ${HEADER_PADDING} flex flex-col overflow-y-auto overflow-x-hidden relative`}
               ref={scrollableDivRef}
             >
               {livePersona && (
-                <div className="sticky top-0 left-80 z-10 w-full bg-background/90">
+                <div className="sticky top-0 left-80 z-10 w-full bg-background/90 flex">
                   <div className="ml-2 p-1 rounded mt-2 w-fit">
                     <ChatPersonaSelector
                       personas={availablePersonas}
@@ -514,11 +604,22 @@ export const Chat = ({
                         if (persona) {
                           setSelectedPersona(persona);
                           textareaRef.current?.focus();
-                          router.push(`/chat?personaId=${persona.id}`);
+                          router.push(
+                            buildChatUrl(searchParams, null, persona.id)
+                          );
                         }
                       }}
                     />
                   </div>
+
+                  {chatSessionId !== null && (
+                    <div
+                      onClick={() => setSharingModalVisible(true)}
+                      className="ml-auto mr-6 my-auto border-border border p-2 rounded cursor-pointer hover:bg-hover-light"
+                    >
+                      <FiShare2 />
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -532,7 +633,7 @@ export const Chat = ({
                     handlePersonaSelect={(persona) => {
                       setSelectedPersona(persona);
                       textareaRef.current?.focus();
-                      router.push(`/chat?personaId=${persona.id}`);
+                      router.push(buildChatUrl(searchParams, null, persona.id));
                     }}
                   />
                 )}
@@ -564,6 +665,7 @@ export const Chat = ({
                           messageId={message.messageId}
                           content={message.message}
                           query={messageHistory[i]?.query || undefined}
+                          personaName={livePersona.name}
                           citedDocuments={getCitedDocumentsFromMessage(message)}
                           isComplete={
                             i !== messageHistory.length - 1 || !isStreaming
@@ -644,6 +746,7 @@ export const Chat = ({
                       <div key={i}>
                         <AIMessage
                           messageId={message.messageId}
+                          personaName={livePersona.name}
                           content={
                             <p className="text-red-700 text-sm my-auto">
                               {message.message}
@@ -661,6 +764,7 @@ export const Chat = ({
                     <div key={messageHistory.length}>
                       <AIMessage
                         messageId={null}
+                        personaName={livePersona.name}
                         content={
                           <div className="text-sm my-auto">
                             <ThreeDots
@@ -681,6 +785,42 @@ export const Chat = ({
 
                 {/* Some padding at the bottom so the search bar has space at the bottom to not cover the last message*/}
                 <div className={`min-h-[30px] w-full`}></div>
+
+                {livePersona &&
+                  livePersona.starter_messages &&
+                  livePersona.starter_messages.length > 0 &&
+                  selectedPersona &&
+                  messageHistory.length === 0 &&
+                  !isFetchingChatMessages && (
+                    <div
+                      className={`
+                      mx-auto 
+                      px-4 
+                      w-searchbar-xs 
+                      2xl:w-searchbar-sm 
+                      3xl:w-searchbar 
+                      grid 
+                      gap-4 
+                      grid-cols-1 
+                      grid-rows-1 
+                      mt-4 
+                      md:grid-cols-2 
+                      mb-6`}
+                    >
+                      {livePersona.starter_messages.map((starterMessage, i) => (
+                        <div key={i} className="w-full">
+                          <StarterMessage
+                            starterMessage={starterMessage}
+                            onClick={() =>
+                              onSubmit({
+                                messageOverride: starterMessage.message,
+                              })
+                            }
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
                 <div ref={endDivRef} />
               </div>
@@ -713,30 +853,30 @@ export const Chat = ({
                       ref={textareaRef}
                       autoFocus
                       className={`
-                    opacity-100
-                    w-full
-                    shrink
-                    border 
-                    border-border 
-                    rounded-lg 
-                    outline-none 
-                    placeholder-gray-400 
-                    pl-4
-                    pr-12 
-                    py-4 
-                    overflow-hidden
-                    h-14
-                    ${
-                      (textareaRef?.current?.scrollHeight || 0) >
-                      MAX_INPUT_HEIGHT
-                        ? "overflow-y-auto"
-                        : ""
-                    } 
-                    whitespace-normal 
-                    break-word
-                    overscroll-contain
-                    resize-none
-                    `}
+                        opacity-100
+                        w-full
+                        shrink
+                        border 
+                        border-border 
+                        rounded-lg 
+                        outline-none 
+                        placeholder-gray-400 
+                        pl-4
+                        pr-12 
+                        py-4 
+                        overflow-hidden
+                        h-14
+                        ${
+                          (textareaRef?.current?.scrollHeight || 0) >
+                          MAX_INPUT_HEIGHT
+                            ? "overflow-y-auto"
+                            : ""
+                        } 
+                        whitespace-normal 
+                        break-word
+                        overscroll-contain
+                        resize-none
+                      `}
                       style={{ scrollbarWidth: "thin" }}
                       role="textarea"
                       aria-multiline

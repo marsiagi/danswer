@@ -19,7 +19,9 @@ APP_API_PREFIX = os.environ.get("API_PREFIX", "")
 # User Facing Features Configs
 #####
 BLURB_SIZE = 128  # Number Encoder Tokens included in the chunk blurb
-GENERATIVE_MODEL_ACCESS_CHECK_FREQ = 86400  # 1 day
+GENERATIVE_MODEL_ACCESS_CHECK_FREQ = int(
+    os.environ.get("GENERATIVE_MODEL_ACCESS_CHECK_FREQ") or 86400
+)  # 1 day
 DISABLE_GENERATIVE_AI = os.environ.get("DISABLE_GENERATIVE_AI", "").lower() == "true"
 
 
@@ -155,6 +157,11 @@ CONFLUENCE_CONNECTOR_LABELS_TO_SKIP = [
     )
     if ignored_tag
 ]
+JIRA_CONNECTOR_LABELS_TO_SKIP = [
+    ignored_tag
+    for ignored_tag in os.environ.get("JIRA_CONNECTOR_LABELS_TO_SKIP", "").split(",")
+    if ignored_tag
+]
 
 GONG_CONNECTOR_START_TIME = os.environ.get("GONG_CONNECTOR_START_TIME")
 
@@ -196,30 +203,17 @@ ENABLE_MINI_CHUNK = os.environ.get("ENABLE_MINI_CHUNK", "").lower() == "true"
 MINI_CHUNK_SIZE = 150
 # Timeout to wait for job's last update before killing it, in hours
 CLEANUP_INDEXING_JOBS_TIMEOUT = int(os.environ.get("CLEANUP_INDEXING_JOBS_TIMEOUT", 3))
-
-
-#####
-# Model Server Configs
-#####
-# If MODEL_SERVER_HOST is set, the NLP models required for Danswer are offloaded to the server via
-# requests. Be sure to include the scheme in the MODEL_SERVER_HOST value.
-MODEL_SERVER_HOST = os.environ.get("MODEL_SERVER_HOST") or None
-MODEL_SERVER_ALLOWED_HOST = os.environ.get("MODEL_SERVER_HOST") or "0.0.0.0"
-MODEL_SERVER_PORT = int(os.environ.get("MODEL_SERVER_PORT") or "9000")
-
-# specify this env variable directly to have a different model server for the background
-# indexing job vs the api server so that background indexing does not effect query-time
-# performance
-INDEXING_MODEL_SERVER_HOST = (
-    os.environ.get("INDEXING_MODEL_SERVER_HOST") or MODEL_SERVER_HOST
+# If set to true, then will not clean up documents that "no longer exist" when running Load connectors
+DISABLE_DOCUMENT_CLEANUP = (
+    os.environ.get("DISABLE_DOCUMENT_CLEANUP", "").lower() == "true"
 )
 
 
 #####
 # Miscellaneous
 #####
-DYNAMIC_CONFIG_STORE = os.environ.get(
-    "DYNAMIC_CONFIG_STORE", "FileSystemBackedDynamicConfigStore"
+DYNAMIC_CONFIG_STORE = (
+    os.environ.get("DYNAMIC_CONFIG_STORE") or "PostgresBackedDynamicConfigStore"
 )
 DYNAMIC_CONFIG_DIR_PATH = os.environ.get("DYNAMIC_CONFIG_DIR_PATH", "/home/storage")
 JOB_TIMEOUT = 60 * 60 * 6  # 6 hours default
@@ -239,5 +233,7 @@ LOG_VESPA_TIMING_INFORMATION = (
 )
 # Anonymous usage telemetry
 DISABLE_TELEMETRY = os.environ.get("DISABLE_TELEMETRY", "").lower() == "true"
-# notset, debug, info, warning, error, or critical
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "info")
+
+TOKEN_BUDGET_GLOBALLY_ENABLED = (
+    os.environ.get("TOKEN_BUDGET_GLOBALLY_ENABLED", "").lower() == "true"
+)

@@ -10,6 +10,7 @@ from danswer.background.connector_deletion import (
     _delete_connector_credential_pair_batch,
 )
 from danswer.background.indexing.checkpointing import get_time_windows_for_index_attempt
+from danswer.configs.app_configs import DISABLE_DOCUMENT_CLEANUP
 from danswer.configs.app_configs import POLL_CONNECTOR_OFFSET
 from danswer.connectors.factory import instantiate_connector
 from danswer.connectors.interfaces import GenerateDocumentsOutput
@@ -232,7 +233,7 @@ def _run_indexing(
                     docs_removed_from_index=0,
                 )
 
-            if is_listing_complete:
+            if is_listing_complete and not DISABLE_DOCUMENT_CLEANUP:
                 # clean up all documents from the index that have not been returned from the connector
                 all_indexed_document_ids = {
                     d.id
@@ -329,19 +330,14 @@ def _run_indexing(
     )
 
 
-def run_indexing_entrypoint(index_attempt_id: int, num_threads: int) -> None:
+def run_indexing_entrypoint(index_attempt_id: int) -> None:
     """Entrypoint for indexing run when using dask distributed.
     Wraps the actual logic in a `try` block so that we can catch any exceptions
     and mark the attempt as failed."""
-    import torch
-
     try:
         # set the indexing attempt ID so that all log messages from this process
         # will have it added as a prefix
         IndexAttemptSingleton.set_index_attempt_id(index_attempt_id)
-
-        logger.info(f"Setting task to use {num_threads} threads")
-        torch.set_num_threads(num_threads)
 
         with Session(get_sqlalchemy_engine()) as db_session:
             attempt = get_index_attempt(

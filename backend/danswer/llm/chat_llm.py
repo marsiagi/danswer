@@ -2,9 +2,9 @@ import abc
 from collections.abc import Iterator
 
 import litellm  # type:ignore
-from langchain.chat_models import ChatLiteLLM
 from langchain.chat_models.base import BaseChatModel
 from langchain.schema.language_model import LanguageModelInput
+from langchain_community.chat_models import ChatLiteLLM
 
 from danswer.configs.app_configs import LOG_ALL_MODEL_INTERACTIONS
 from danswer.configs.model_configs import GEN_AI_API_ENDPOINT
@@ -134,7 +134,11 @@ class DefaultMultiLLM(LangChainChatLLM):
             max_tokens=max_output_tokens,
             temperature=temperature,
             request_timeout=timeout,
-            model_kwargs=DefaultMultiLLM.DEFAULT_MODEL_PARAMS,
+            # LiteLLM and some model providers don't handle these params well
+            # only turning it on for OpenAI
+            model_kwargs=DefaultMultiLLM.DEFAULT_MODEL_PARAMS
+            if model_provider == "openai"
+            else {},
             verbose=should_be_verbose(),
             max_retries=0,  # retries are handled outside of langchain
         )
